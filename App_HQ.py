@@ -164,7 +164,7 @@ def predict_single(image: str, resolution: str, weights_file: str, use_local: bo
         return input_path, []
 
 
-def predict_batch(resolution: str, weights_file: str, use_local: bool, use_half_precision: bool, batch_folder: str, output_folder: str):
+def predict_batch(resolution: str, weights_file: str, use_local: bool, use_half_precision: bool, batch_folder: str, output_folder: str, display_images: bool):
     global birefnet
     batch_processing_stop_event.clear()  # Reset the stop event at the start
     model_name = usage_to_weights_file.get(weights_file, 'BiRefNet_HR')
@@ -186,14 +186,24 @@ def predict_batch(resolution: str, weights_file: str, use_local: bool, use_half_
             input_path, output_path, proc_time = process_single_image(img_path, resolution, output_folder, use_half_precision)
             if output_path:
                 # Crucial Change: Return (filepath, filepath) tuples for Gallery
-                results.append((output_path, output_path)) # Both paths are the same
+                if display_images:
+                    results.append((output_path, output_path)) # Both paths are the same
+                else:
+                    results.append((output_path,)) # Append only output path, Gallery component will be handled accordingly
+
             processed_images += 1
             elapsed_time = time.time() - start_time
             avg_time_per_image = elapsed_time / processed_images
             estimated_time_left = avg_time_per_image * (total_images - processed_images)
             status = f"Processed {processed_images}/{total_images} images. Estimated time left: {estimated_time_left:.2f} seconds"
             print(status)
-            yield status, results
+
+            if display_images:
+               yield status, results
+            else:
+               yield status, [] # Always yield empty list when display_images is false
+
+
         except Exception as e:
             print(f"Error processing {img_path}: {str(e)}")
             continue
@@ -202,7 +212,7 @@ def predict_batch(resolution: str, weights_file: str, use_local: bool, use_half_
         status_msg = f"Batch processing stopped. Processed {processed_images}/{total_images} images."
     else:
         status_msg = f"Batch processing complete. Processed {processed_images}/{total_images} images."
-    yield status_msg, results
+    yield status_msg, [] if not display_images else results
 
 
 def stop_batch_processing():
@@ -212,7 +222,7 @@ def stop_batch_processing():
 
 def create_interface():
     with gr.Blocks() as demo:
-        gr.Markdown("## SECourses Improved BiRefNet HQ V4 - Source : https://www.patreon.com/posts/121679760")
+        gr.Markdown("## SECourses Improved BiRefNet HQ V5 - Source : https://www.patreon.com/posts/121679760")
 
         with gr.Tab("Single Image Processing"):
             with gr.Row():
@@ -240,6 +250,8 @@ def create_interface():
                     use_local_checkbox_batch = gr.Checkbox(label="Use Local Model", value=False) # Local model for batch
                     use_half_precision_checkbox_batch = gr.Checkbox(label="Use CUDA Half Precision", value=True, interactive=True) # Half precision for batch
                     output_folder_batch = gr.Textbox(label="Output Folder Path", value="results")  # Separate output folder for batch
+                    display_images_checkbox = gr.Checkbox(label="Display Images During Batch Processing", value=True)  # Checkbox for displaying images
+
 
                with gr.Column():
                     output_image_batch = gr.Gallery(label="Output Image", elem_id="gallery_batch") # Batch output
@@ -259,7 +271,7 @@ def create_interface():
         # --- Batch Processing ---
         batch_button.click(
             predict_batch,
-            inputs=[resolution_batch, weights_file_batch, use_local_checkbox_batch, use_half_precision_checkbox_batch, batch_folder, output_folder_batch],
+            inputs=[resolution_batch, weights_file_batch, use_local_checkbox_batch, use_half_precision_checkbox_batch, batch_folder, output_folder_batch, display_images_checkbox],
             outputs=[batch_output_text, output_image_batch]
         )
         stop_button.click(
