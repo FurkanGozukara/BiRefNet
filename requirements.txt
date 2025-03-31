@@ -18,3 +18,4 @@ accelerate
 hf_transfer
 xformers==0.0.28.post3
 matplotlib
+pydantic==2.10.6
