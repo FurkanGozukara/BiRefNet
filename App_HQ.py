@@ -222,7 +222,7 @@ def stop_batch_processing():
 
 def create_interface():
     with gr.Blocks() as demo:
-        gr.Markdown("## SECourses Improved BiRefNet HQ V5 - Source : https://www.patreon.com/posts/121679760")
+        gr.Markdown("## SECourses Improved BiRefNet HQ V6 - Source : https://www.patreon.com/posts/121679760")
 
         with gr.Tab("Single Image Processing"):
             with gr.Row():
