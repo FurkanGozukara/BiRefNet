@@ -11,6 +11,7 @@ import platform
 import matplotlib.pyplot as plt
 from glob import glob
 import threading  # Import the threading module
+from contextlib import nullcontext
 
 # --- Assume models are in a 'models' subdirectory ---
 try:
@@ -34,12 +35,102 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # --- Global variable to control batch processing ---
 batch_processing_stop_event = threading.Event()  # Use an event for thread-safe stopping
 
+# --- Mixed Precision Configuration ---
+MIXED_PRECISION_OPTIONS = {
+    'No Mixed Precision (FP32)': 'no',
+    'Float16 (FP16)': 'fp16',
+    'BFloat16 (BF16 - Recommended)': 'bf16'
+}
+
+def get_autocast_context(precision_mode: str):
+    """Create appropriate autocast context for mixed precision inference."""
+    if precision_mode == 'fp16':
+        return torch.amp.autocast(device_type='cuda', dtype=torch.float16)
+    elif precision_mode == 'bf16':
+        return torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+    else:
+        return nullcontext()
+
+# --- Resolution Presets ---
+RESOLUTION_PRESETS = {
+    'Original (No Resize)': None,
+    '1024x1024': (1024, 1024),
+    '2048x2048': (2048, 2048),
+    '4096x4096': (4096, 4096),
+    'Custom': 'custom'
+}
+
 def open_folder():
     open_folder_path = os.path.abspath("results")
     if platform.system() == "Windows":
         os.startfile(open_folder_path)
     elif platform.system() == "Linux":
         os.system(f'xdg-open "{open_folder_path}"')
+
+def parse_resolution(resolution_preset: str, resolution_custom: str, image_path: str = None, config_size=(2048, 2048)):
+    """
+    Parse resolution with multiple modes:
+    - 'Original (No Resize)': Use original image resolution (None)
+    - Preset values: Use predefined resolution tuples
+    - 'Custom': Parse custom resolution string
+    """
+    try:
+        # Check if it's a preset
+        if resolution_preset in RESOLUTION_PRESETS:
+            preset_value = RESOLUTION_PRESETS[resolution_preset]
+            
+            if preset_value is None:
+                # Original resolution mode
+                return None
+            elif preset_value == 'custom':
+                # Parse custom resolution
+                if not resolution_custom or resolution_custom.strip() == '':
+                    print("Custom resolution selected but no value provided. Using config size.")
+                    return config_size
+                parsed = [int(int(reso)//32*32) for reso in resolution_custom.strip().split('x')]
+                if len(parsed) != 2:
+                    raise ValueError("Resolution must be in format: WIDTHxHEIGHT")
+                return tuple(parsed)
+            else:
+                # Direct preset tuple
+                return preset_value
+        else:
+            # Fallback: try to parse as string
+            if resolution_preset in [None, '', 'None', 'original']:
+                return None
+            parsed = [int(int(reso)//32*32) for reso in resolution_preset.strip().split('x')]
+            return tuple(parsed)
+    except Exception as e:
+        print(f"Resolution parsing error: {e}. Using config size {config_size}.")
+        return config_size
+
+def generate_output_path(base_folder: str, image_path: str, resolution: tuple, 
+                        model_name: str, add_metadata=True) -> str:
+    """Generate organized output path with optional metadata."""
+    base_filename = os.path.splitext(os.path.basename(image_path))[0]
+    
+    if add_metadata:
+        # Create subfolder with model and resolution info
+        if resolution is None:
+            reso_str = "original"
+        else:
+            reso_str = f"{resolution[0]}x{resolution[1]}"
+        
+        subfolder = os.path.join(base_folder, f"{model_name}-reso_{reso_str}")
+        os.makedirs(subfolder, exist_ok=True)
+    else:
+        subfolder = base_folder
+        os.makedirs(subfolder, exist_ok=True)
+    
+    output_path = os.path.join(subfolder, f"{base_filename}.png")
+    
+    # Handle duplicates
+    counter = 1
+    while os.path.exists(output_path):
+        output_path = os.path.join(subfolder, f"{base_filename}_{counter:04d}.png")
+        counter += 1
+    
+    return output_path
 
 usage_to_weights_file = {
     'General (BiRefNet)': 'BiRefNet',
@@ -52,7 +143,11 @@ usage_to_weights_file = {
     'BiRefNet_HR (High Resolution 2048x2048)': 'BiRefNet_HR',
 }
 
-def load_model(weights_file: str, use_local: bool = False, use_half_precision: bool = True):
+def load_model(weights_file: str, use_local: bool = False):
+    """
+    Load model without precision conversion.
+    Precision is now handled by autocast during inference.
+    """
     model_path = os.path.join("models", f"{weights_file}.pth")
     huggingface_path = f'ZhengPeng7/{weights_file}'
 
@@ -81,40 +176,67 @@ def load_model(weights_file: str, use_local: bool = False, use_half_precision: b
 
     if birefnet is not None:
         birefnet.to(device)
-        if device == 'cuda' and use_half_precision:
-            birefnet.half()
+        # Keep model in FP32 - autocast handles precision during forward pass
         birefnet.eval()
     return birefnet
 
 # Load default model
-birefnet = load_model("BiRefNet_HR", use_half_precision=True)
+birefnet = load_model("BiRefNet_HR")
 
-def extract_object(birefnet, imagepath, image_size=(2048, 2048), use_half_precision=True):
-    transform_image = transforms.Compose([
-        transforms.Resize(image_size),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
+def create_transform(image_size=None):
+    """Create transform pipeline that optionally skips resize."""
+    if image_size is None:
+        # Original resolution mode - no resize
+        return transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+    else:
+        # Resize mode
+        return transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
 
+def extract_object(birefnet, imagepath, image_size=(2048, 2048), precision_mode='bf16'):
+    """
+    Extract object with mixed precision support and optional resizing.
+    
+    Args:
+        birefnet: Model instance
+        imagepath: Path to input image
+        image_size: Target size (W, H) or None for original resolution
+        precision_mode: 'no', 'fp16', or 'bf16'
+    """
     image = Image.open(imagepath)
     if image is None:
         raise ValueError(f"Could not open image at {imagepath}")
 
     image = image.convert("RGB")
     original_size = image.size
+
+    if image_size is None:
+        width, height = original_size
+        eff_w = max(32, (width // 32) * 32)
+        eff_h = max(32, (height // 32) * 32)
+        effective_size = (eff_w, eff_h)
+    else:
+        effective_size = image_size
+
+    transform_image = create_transform(effective_size)
+
     input_tensor = transform_image(image)
 
     if input_tensor.shape[0] == 4:
         input_tensor = input_tensor[:3, :, :]
 
-    input_images = input_tensor.unsqueeze(0)
-    if device == 'cuda' and use_half_precision:
-        input_images = input_images.to(device).half()
-    else:
-         input_images = input_images.to(device)
+    input_images = input_tensor.unsqueeze(0).to(device)  # Keep in FP32
 
-    with torch.no_grad():
-        preds = birefnet(input_images)[-1].sigmoid().cpu()
+    # Use autocast for mixed precision
+    autocast_ctx = get_autocast_context(precision_mode)
+    with autocast_ctx, torch.no_grad():
+        preds = birefnet(input_images)[-1].sigmoid().to(torch.float32).cpu()  # Explicit FP32 conversion
 
     pred = preds[0].squeeze()
     pred_pil = transforms.ToPILImage()(pred)
@@ -124,51 +246,96 @@ def extract_object(birefnet, imagepath, image_size=(2048, 2048), use_half_precis
 
     return image, mask
 
-def process_single_image(image_path: str, resolution: str, output_folder: str, use_half_precision:bool) -> Tuple[str, str, float]:
+def process_single_image(image_path: str, resolution_preset: str, resolution_custom: str, 
+                         output_folder: str, model_name: str, precision_mode: str = 'bf16',
+                         add_metadata: bool = True) -> Tuple[str, str, float]:
+    """
+    Process a single image with enhanced resolution and output handling.
+    
+    Args:
+        image_path: Path to input image
+        resolution_preset: Preset resolution option
+        resolution_custom: Custom resolution string (used if preset is 'Custom')
+        output_folder: Base output folder
+        model_name: Model identifier for metadata
+        precision_mode: 'no', 'fp16', or 'bf16'
+        add_metadata: Whether to add model/resolution info to output path
+    """
     start_time = time.time()
 
-    if resolution == '':
-        with Image.open(image_path) as img:
-            resolution = f"{img.width}x{img.height}"
-    resolution = [int(int(reso)//32*32) for reso in resolution.strip().split('x')]
+    # Parse resolution using new system
+    image_size = parse_resolution(resolution_preset, resolution_custom, image_path)
 
     try:
-        output_image, _ = extract_object(birefnet, image_path, image_size=tuple(resolution), use_half_precision=use_half_precision)
+        output_image, _ = extract_object(birefnet, image_path, image_size=image_size, precision_mode=precision_mode)
     except ValueError as e:
         return str(e), "", 0.0
 
-    base_filename = os.path.splitext(os.path.basename(image_path))[0]
-    output_path = os.path.join(output_folder, f"{base_filename}.png")
-
-    counter = 1
-    while os.path.exists(output_path):
-        output_path = os.path.join(output_folder, f"{base_filename}_{counter:04d}.png")
-        counter += 1
+    # Generate output path with optional metadata
+    output_path = generate_output_path(output_folder, image_path, image_size, model_name, add_metadata)
 
     output_image.save(output_path)
     processing_time = time.time() - start_time
     return image_path, output_path, processing_time
 
-def predict_single(image: str, resolution: str, weights_file: str, use_local: bool, use_half_precision: bool) -> Tuple[str, List[Tuple[str, str]]]:
+def predict_single(image: str, resolution_preset: str, resolution_custom: str, weights_file: str, 
+                  use_local: bool, precision_mode: str, add_metadata: bool) -> Tuple[str, List[Tuple[str, str]]]:
+    """
+    Process single image with new parameter structure.
+    
+    Args:
+        image: Input image path
+        resolution_preset: Preset resolution option
+        resolution_custom: Custom resolution (if preset is 'Custom')
+        weights_file: Model selection
+        use_local: Use local model file
+        precision_mode: Mixed precision mode ('no', 'fp16', 'bf16')
+        add_metadata: Add model/resolution info to output paths
+    """
     global birefnet
     model_name = usage_to_weights_file.get(weights_file, 'BiRefNet_HR')
-    birefnet = load_model(model_name, use_local, use_half_precision)
+    birefnet = load_model(model_name, use_local)
     if birefnet is None:
         return "Error: Model loading failed.", []
-    output_folder="results"
+    
+    output_folder = "results"
     os.makedirs(output_folder, exist_ok=True)
-    input_path, output_path, proc_time = process_single_image(image, resolution, output_folder, use_half_precision)
+    
+    # Convert precision mode from display name to internal format
+    precision_internal = MIXED_PRECISION_OPTIONS.get(precision_mode, 'bf16')
+    
+    input_path, output_path, proc_time = process_single_image(
+        image, resolution_preset, resolution_custom, output_folder, 
+        model_name, precision_internal, add_metadata
+    )
+    
     if output_path:
         return "Single image processing complete.", [(output_path, f"{proc_time:.4f} seconds")]
     else:
         return input_path, []
 
 
-def predict_batch(resolution: str, weights_file: str, use_local: bool, use_half_precision: bool, batch_folder: str, output_folder: str, display_images: bool):
+def predict_batch(resolution_preset: str, resolution_custom: str, weights_file: str, use_local: bool, 
+                 precision_mode: str, batch_folder: str, output_folder: str, 
+                 display_images: bool, add_metadata: bool):
+    """
+    Process batch of images with new parameter structure.
+    
+    Args:
+        resolution_preset: Preset resolution option
+        resolution_custom: Custom resolution (if preset is 'Custom')
+        weights_file: Model selection
+        use_local: Use local model file
+        precision_mode: Mixed precision mode
+        batch_folder: Input folder path
+        output_folder: Output folder path
+        display_images: Whether to display images in gallery
+        add_metadata: Add model/resolution info to output paths
+    """
     global birefnet
     batch_processing_stop_event.clear()  # Reset the stop event at the start
     model_name = usage_to_weights_file.get(weights_file, 'BiRefNet_HR')
-    birefnet = load_model(model_name, use_local, use_half_precision)
+    birefnet = load_model(model_name, use_local)
     if birefnet is None:
         return "Error: Model loading failed.", []
 
@@ -178,12 +345,18 @@ def predict_batch(resolution: str, weights_file: str, use_local: bool, use_half_
     total_images = len(image_files)
     processed_images = 0
     start_time = time.time()
+    
+    # Convert precision mode from display name to internal format
+    precision_internal = MIXED_PRECISION_OPTIONS.get(precision_mode, 'bf16')
 
     for img_path in image_files:
         if batch_processing_stop_event.is_set():  # Check if the stop event is set
             break
         try:
-            input_path, output_path, proc_time = process_single_image(img_path, resolution, output_folder, use_half_precision)
+            input_path, output_path, proc_time = process_single_image(
+                img_path, resolution_preset, resolution_custom, output_folder, 
+                model_name, precision_internal, add_metadata
+            )
             if output_path:
                 # Crucial Change: Return (filepath, filepath) tuples for Gallery
                 if display_images:
@@ -203,7 +376,6 @@ def predict_batch(resolution: str, weights_file: str, use_local: bool, use_half_
             else:
                yield status, [] # Always yield empty list when display_images is false
 
-
         except Exception as e:
             print(f"Error processing {img_path}: {str(e)}")
             continue
@@ -222,58 +394,176 @@ def stop_batch_processing():
 
 def create_interface():
     with gr.Blocks() as demo:
-        gr.Markdown("## SECourses Improved BiRefNet HQ V6 - Source : https://www.patreon.com/posts/121679760")
+        gr.Markdown("## SECourses Improved BiRefNet HQ V7 - https://www.patreon.com/posts/121679760")
+        gr.Markdown("**New Features:** BFloat16 precision (default), Original resolution mode, Enhanced output organization")
 
         with gr.Tab("Single Image Processing"):
             with gr.Row():
-                with gr.Column():  # Use columns for better layout control
+                with gr.Column():
                     input_image = gr.Image(type="filepath", label="Input Image", height=512)
-                    submit_button = gr.Button("Process Single Image")
-                    weights_file = gr.Dropdown(choices=list(usage_to_weights_file.keys()), value="BiRefNet_HR (High Resolution 2048x2048)", label="Weights File")                    
+                    
+                    with gr.Row():
+                        resolution_preset = gr.Dropdown(
+                            choices=list(RESOLUTION_PRESETS.keys()),
+                            value='2048x2048',
+                            label="Resolution Preset",
+                            info="Select resolution or use original size"
+                        )
+                    
+                    resolution_custom = gr.Textbox(
+                        label="Custom Resolution (WIDTHxHEIGHT)",
+                        placeholder="3072x3072",
+                        value="2048x2048",
+                        visible=False,
+                        info="Only used when 'Custom' preset is selected"
+                    )
+                    
+                    weights_file = gr.Dropdown(
+                        choices=list(usage_to_weights_file.keys()),
+                        value="BiRefNet_HR (High Resolution 2048x2048)",
+                        label="Model Selection"
+                    )
+                    
+                    precision_mode = gr.Dropdown(
+                        choices=list(MIXED_PRECISION_OPTIONS.keys()),
+                        value='BFloat16 (BF16 - Recommended)',
+                        label="Mixed Precision Mode",
+                        info="BF16: Best balance of speed/quality. FP16: Faster but may have artifacts. FP32: Highest quality, slowest."
+                    )
+                    
+                    add_metadata_checkbox = gr.Checkbox(
+                        label="Organize Output by Model/Resolution",
+                        value=True,
+                        info="Creates subfolders like 'BiRefNet_HR-reso_2048x2048' for better organization"
+                    )
+                    
+                    use_local_checkbox = gr.Checkbox(
+                        label="Use Local Model",
+                        value=False,
+                        info="Load from local .pth file instead of HuggingFace"
+                    )
+                    
+                    submit_button = gr.Button("Process Single Image", variant="primary")
                     single_output_text = gr.Textbox(label="Processing Status")
-                    resolution = gr.Textbox(label="Resolution", placeholder="2048x2048 (or original)", value="2048x2048")                                                           
 
                 with gr.Column():
-                     output_image = gr.Gallery(label="Output Image", elem_id="gallery", height=512)
-                     btn_open_outputs = gr.Button("Open Results Folder")
-                     btn_open_outputs.click(fn=open_folder)                     
-                     use_half_precision_checkbox = gr.Checkbox(label="Use CUDA Half Precision", value=True, interactive=True) 
-                     use_local_checkbox = gr.Checkbox(label="Use Local Model", value=False)
+                    output_image = gr.Gallery(label="Output Image", elem_id="gallery", height=512)
+                    btn_open_outputs = gr.Button("📁 Open Results Folder")
+                    btn_open_outputs.click(fn=open_folder)
 
+            # Show/hide custom resolution based on preset selection
+            def update_custom_visibility(preset):
+                return gr.update(visible=(preset == 'Custom'))
+            
+            resolution_preset.change(
+                update_custom_visibility,
+                inputs=[resolution_preset],
+                outputs=[resolution_custom]
+            )
 
         with gr.Tab("Batch Processing"):
             with gr.Row():
-               with gr.Column():
-                    batch_folder = gr.Textbox(label="Batch Folder Path")
-                    resolution_batch = gr.Textbox(label="Resolution", placeholder="2048x2048 (or original)", value="2048x2048")  #Resolution for batch
-                    weights_file_batch = gr.Dropdown(choices=list(usage_to_weights_file.keys()), value="BiRefNet_HR (High Resolution 2048x2048)", label="Weights File") # Weight file for batch
-                    use_local_checkbox_batch = gr.Checkbox(label="Use Local Model", value=False) # Local model for batch
-                    use_half_precision_checkbox_batch = gr.Checkbox(label="Use CUDA Half Precision", value=True, interactive=True) # Half precision for batch
-                    output_folder_batch = gr.Textbox(label="Output Folder Path", value="results")  # Separate output folder for batch
-                    display_images_checkbox = gr.Checkbox(label="Display Images During Batch Processing", value=True)  # Checkbox for displaying images
+                with gr.Column():
+                    batch_folder = gr.Textbox(
+                        label="Input Folder Path",
+                        placeholder="Path to folder containing images"
+                    )
+                    
+                    with gr.Row():
+                        resolution_preset_batch = gr.Dropdown(
+                            choices=list(RESOLUTION_PRESETS.keys()),
+                            value='2048x2048',
+                            label="Resolution Preset"
+                        )
+                    
+                    resolution_custom_batch = gr.Textbox(
+                        label="Custom Resolution (WIDTHxHEIGHT)",
+                        placeholder="3072x3072",
+                        value="2048x2048",
+                        visible=False
+                    )
+                    
+                    weights_file_batch = gr.Dropdown(
+                        choices=list(usage_to_weights_file.keys()),
+                        value="BiRefNet_HR (High Resolution 2048x2048)",
+                        label="Model Selection"
+                    )
+                    
+                    precision_mode_batch = gr.Dropdown(
+                        choices=list(MIXED_PRECISION_OPTIONS.keys()),
+                        value='BFloat16 (BF16 - Recommended)',
+                        label="Mixed Precision Mode"
+                    )
+                    
+                    output_folder_batch = gr.Textbox(
+                        label="Output Folder Path",
+                        value="results"
+                    )
+                    
+                    add_metadata_checkbox_batch = gr.Checkbox(
+                        label="Organize Output by Model/Resolution",
+                        value=True
+                    )
+                    
+                    use_local_checkbox_batch = gr.Checkbox(
+                        label="Use Local Model",
+                        value=False
+                    )
+                    
+                    display_images_checkbox = gr.Checkbox(
+                        label="Display Images During Processing",
+                        value=False,
+                        info="Disable for faster processing of large batches"
+                    )
+                    
+                    with gr.Row():
+                        batch_button = gr.Button("Start Batch Processing", variant="primary")
+                        stop_button = gr.Button("Stop Batch Processing", variant="stop")
+                    
+                    batch_output_text = gr.Textbox(label="Batch Processing Status")
 
+                with gr.Column():
+                    output_image_batch = gr.Gallery(label="Output Images", elem_id="gallery_batch")
 
-               with gr.Column():
-                    output_image_batch = gr.Gallery(label="Output Image", elem_id="gallery_batch") # Batch output
-            batch_button = gr.Button("Start Batch Processing")
-            stop_button = gr.Button("Stop Batch Processing")
-            batch_output_text = gr.Textbox(label="Batch Processing Status")
-
-
+            # Show/hide custom resolution based on preset selection
+            resolution_preset_batch.change(
+                update_custom_visibility,
+                inputs=[resolution_preset_batch],
+                outputs=[resolution_custom_batch]
+            )
 
         # --- Single Image Processing ---
         submit_button.click(
             predict_single,
-            inputs=[input_image, resolution, weights_file, use_local_checkbox, use_half_precision_checkbox],
+            inputs=[
+                input_image,
+                resolution_preset,
+                resolution_custom,
+                weights_file,
+                use_local_checkbox,
+                precision_mode,
+                add_metadata_checkbox
+            ],
             outputs=[single_output_text, output_image]
         )
 
         # --- Batch Processing ---
         batch_button.click(
             predict_batch,
-            inputs=[resolution_batch, weights_file_batch, use_local_checkbox_batch, use_half_precision_checkbox_batch, batch_folder, output_folder_batch, display_images_checkbox],
+            inputs=[
+                resolution_preset_batch,
+                resolution_custom_batch,
+                weights_file_batch,
+                use_local_checkbox_batch,
+                precision_mode_batch,
+                batch_folder,
+                output_folder_batch,
+                display_images_checkbox,
+                add_metadata_checkbox_batch
+            ],
             outputs=[batch_output_text, output_image_batch]
         )
+        
         stop_button.click(
             stop_batch_processing,
             inputs=[],
