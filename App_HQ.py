@@ -22,10 +22,27 @@ except ImportError:
     LOCAL_MODEL_AVAILABLE = False
     print("Warning: Local BiRefNet class not found.  Will attempt to load all models from Hugging Face.")
 
+# --- Global Offline Mode State ---
+OFFLINE_MODE_ENABLED = False
+
+def set_offline_mode(enabled: bool):
+    """Enable or disable offline mode globally."""
+    global OFFLINE_MODE_ENABLED
+    OFFLINE_MODE_ENABLED = enabled
+    if enabled:
+        os.environ['HF_HUB_OFFLINE'] = '1'
+        os.environ['TRANSFORMERS_OFFLINE'] = '1'
+        print("Offline mode ENABLED - No internet connections will be attempted")
+    else:
+        os.environ.pop('HF_HUB_OFFLINE', None)
+        os.environ.pop('TRANSFORMERS_OFFLINE', None)
+        print("Offline mode DISABLED - Internet connections allowed")
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run the image segmentation app")
     parser.add_argument("--share", action="store_true", help="Enable sharing of the Gradio interface")
-    parser.add_argument("--allowed_paths", type=str, default="", help="Comma-separated list of additional allowed paths") # Added argument
+    parser.add_argument("--allowed_paths", type=str, default="", help="Comma-separated list of additional allowed paths")
+    parser.add_argument("--offline", action="store_true", help="Enable 100%% offline mode - no internet connections will be made")
     return parser.parse_args()
 
 torch.set_float32_matmul_precision('high')
@@ -143,11 +160,28 @@ usage_to_weights_file = {
     'BiRefNet_HR (High Resolution 2048x2048)': 'BiRefNet_HR',
 }
 
-def load_model(weights_file: str, use_local: bool = False):
+def load_model(weights_file: str, use_local: bool = False, offline_mode: bool = None):
     """
     Load model without precision conversion.
     Precision is now handled by autocast during inference.
+    
+    Args:
+        weights_file: Name of the model weights file
+        use_local: If True, try to load from local .pth file first
+        offline_mode: If True, use only cached/local files (no internet). 
+                      If None, uses global OFFLINE_MODE_ENABLED setting.
     """
+    global OFFLINE_MODE_ENABLED
+    
+    # Use global setting if not explicitly specified
+    if offline_mode is None:
+        offline_mode = OFFLINE_MODE_ENABLED
+    
+    # Set environment variables for offline mode
+    if offline_mode:
+        os.environ['HF_HUB_OFFLINE'] = '1'
+        os.environ['TRANSFORMERS_OFFLINE'] = '1'
+    
     model_path = os.path.join("models", f"{weights_file}.pth")
     huggingface_path = f'ZhengPeng7/{weights_file}'
     birefnet = None  # Initialize to track loading status
@@ -155,7 +189,9 @@ def load_model(weights_file: str, use_local: bool = False):
     # Try local loading first if requested
     if use_local and LOCAL_MODEL_AVAILABLE and os.path.exists(model_path):
         try:
-            birefnet = BiRefNet()
+            # When loading from local .pth, we need to create model with bb_pretrained=False
+            # because the .pth file already contains the full model weights
+            birefnet = BiRefNet(bb_pretrained=False)
             birefnet.load_state_dict(torch.load(model_path, map_location=device))
             print(f"Loaded model from local path: {model_path}")
         except Exception as e:
@@ -166,19 +202,42 @@ def load_model(weights_file: str, use_local: bool = False):
     if birefnet is None:
         # Warn user if they expected local loading
         if use_local and not os.path.exists(model_path):
-            print(f"Warning: Local model file not found at {model_path}. Downloading from Hugging Face...")
+            if offline_mode:
+                print(f"ERROR: Offline mode enabled but local model file not found at {model_path}")
+                print("Please download the model first while online, or place the .pth file in the models folder.")
+                return None
+            else:
+                print(f"Warning: Local model file not found at {model_path}. Downloading from Hugging Face...")
         
         try:
+            # CRITICAL: Always use bb_pretrained=False when loading from pretrained
+            # The pretrained weights already include backbone weights, so we don't need
+            # to download them separately (which would fail in offline mode)
+            hf_kwargs = {
+                'bb_pretrained': False,  # Don't try to load backbone weights separately
+            }
+            
+            if offline_mode:
+                hf_kwargs['local_files_only'] = True
+                print(f"Loading model from HuggingFace cache (offline mode): {huggingface_path}")
+            
             if LOCAL_MODEL_AVAILABLE:
-                birefnet = BiRefNet.from_pretrained(huggingface_path)
+                birefnet = BiRefNet.from_pretrained(huggingface_path, **hf_kwargs)
                 print(f"Loaded model from Hugging Face (BiRefNet): {huggingface_path}")
             else:
                 from transformers import AutoModelForImageSegmentation
-                birefnet = AutoModelForImageSegmentation.from_pretrained(huggingface_path, trust_remote_code=True)
+                # AutoModel doesn't accept bb_pretrained, remove it
+                hf_kwargs_auto = {k: v for k, v in hf_kwargs.items() if k != 'bb_pretrained'}
+                hf_kwargs_auto['trust_remote_code'] = True
+                birefnet = AutoModelForImageSegmentation.from_pretrained(huggingface_path, **hf_kwargs_auto)
                 print(f"Loaded model from Hugging Face (AutoModel): {huggingface_path}")
 
         except Exception as e:
-            print(f"Error loading from Hugging Face {huggingface_path}: {e}. Make sure model exists.")
+            error_msg = str(e)
+            if offline_mode and ("offline mode" in error_msg.lower() or "local_files_only" in error_msg.lower() or "couldn't find" in error_msg.lower()):
+                print(f"ERROR: Model not found in cache. Please run the app once with internet to download: {huggingface_path}")
+            else:
+                print(f"Error loading from Hugging Face {huggingface_path}: {e}. Make sure model exists.")
             return None
 
     if birefnet is not None:
@@ -187,8 +246,9 @@ def load_model(weights_file: str, use_local: bool = False):
         birefnet.eval()
     return birefnet
 
-# Load default model
-birefnet = load_model("BiRefNet_HR")
+# Default model will be loaded on first use, not at startup
+# This allows --offline flag to be processed first
+birefnet = None
 
 def create_transform(image_size=None):
     """Create transform pipeline that optionally skips resize."""
@@ -286,7 +346,8 @@ def process_single_image(image_path: str, resolution_preset: str, resolution_cus
     return image_path, output_path, processing_time
 
 def predict_single(image: str, resolution_preset: str, resolution_custom: str, weights_file: str, 
-                  use_local: bool, precision_mode: str, add_metadata: bool) -> Tuple[str, List[Tuple[str, str]]]:
+                  use_local: bool, precision_mode: str, add_metadata: bool, 
+                  offline_mode: bool = False) -> Tuple[str, List[Tuple[str, str]]]:
     """
     Process single image with new parameter structure.
     
@@ -298,11 +359,18 @@ def predict_single(image: str, resolution_preset: str, resolution_custom: str, w
         use_local: Use local model file
         precision_mode: Mixed precision mode ('no', 'fp16', 'bf16')
         add_metadata: Add model/resolution info to output paths
+        offline_mode: If True, use only cached/local files (no internet)
     """
     global birefnet
+    
+    # Update global offline mode state
+    set_offline_mode(offline_mode)
+    
     model_name = usage_to_weights_file.get(weights_file, 'BiRefNet_HR')
-    birefnet = load_model(model_name, use_local)
+    birefnet = load_model(model_name, use_local, offline_mode=offline_mode)
     if birefnet is None:
+        if offline_mode:
+            return "Error: Model loading failed in offline mode. Make sure the model is cached.", []
         return "Error: Model loading failed.", []
     
     output_folder = "results"
@@ -324,7 +392,7 @@ def predict_single(image: str, resolution_preset: str, resolution_custom: str, w
 
 def predict_batch(resolution_preset: str, resolution_custom: str, weights_file: str, use_local: bool, 
                  precision_mode: str, batch_folder: str, output_folder: str, 
-                 display_images: bool, add_metadata: bool):
+                 display_images: bool, add_metadata: bool, offline_mode: bool = False):
     """
     Process batch of images with new parameter structure.
     
@@ -338,13 +406,22 @@ def predict_batch(resolution_preset: str, resolution_custom: str, weights_file: 
         output_folder: Output folder path
         display_images: Whether to display images in gallery
         add_metadata: Add model/resolution info to output paths
+        offline_mode: If True, use only cached/local files (no internet)
     """
     global birefnet
+    
+    # Update global offline mode state
+    set_offline_mode(offline_mode)
+    
     batch_processing_stop_event.clear()  # Reset the stop event at the start
     model_name = usage_to_weights_file.get(weights_file, 'BiRefNet_HR')
-    birefnet = load_model(model_name, use_local)
+    birefnet = load_model(model_name, use_local, offline_mode=offline_mode)
     if birefnet is None:
-        return "Error: Model loading failed.", []
+        if offline_mode:
+            yield "Error: Model loading failed in offline mode. Make sure the model is cached.", []
+            return
+        yield "Error: Model loading failed.", []
+        return
 
     os.makedirs(output_folder, exist_ok=True)
     results = []
@@ -401,7 +478,7 @@ def stop_batch_processing():
 
 def create_interface():
     with gr.Blocks() as demo:
-        gr.Markdown("## SECourses Improved BiRefNet HQ V8 - https://www.patreon.com/posts/121679760")
+        gr.Markdown("## SECourses Improved BiRefNet HQ V9 - https://www.patreon.com/posts/121679760")
         gr.Markdown("**New Features:** BFloat16 precision (default), Original resolution mode, Enhanced output organization")
 
         with gr.Tab("Single Image Processing"):
@@ -445,9 +522,15 @@ def create_interface():
                     )
                     
                     use_local_checkbox = gr.Checkbox(
-                        label="Use Local Model",
+                        label="Use Local Model (.pth file)",
                         value=False,
-                        info="Load from local .pth file instead of HuggingFace"
+                        info="Load from local .pth file in models/ folder instead of HuggingFace"
+                    )
+                    
+                    offline_mode_checkbox = gr.Checkbox(
+                        label="🔌 Offline Mode (100% No Internet)",
+                        value=False,
+                        info="Use ONLY cached/local models. No internet connections will be made. Models must be pre-downloaded."
                     )
                     
                     submit_button = gr.Button("Process Single Image", variant="primary")
@@ -513,8 +596,15 @@ def create_interface():
                     )
                     
                     use_local_checkbox_batch = gr.Checkbox(
-                        label="Use Local Model",
-                        value=False
+                        label="Use Local Model (.pth file)",
+                        value=False,
+                        info="Load from local .pth file in models/ folder"
+                    )
+                    
+                    offline_mode_checkbox_batch = gr.Checkbox(
+                        label="🔌 Offline Mode (100% No Internet)",
+                        value=False,
+                        info="Use ONLY cached/local models. No internet connections will be made."
                     )
                     
                     display_images_checkbox = gr.Checkbox(
@@ -549,7 +639,8 @@ def create_interface():
                 weights_file,
                 use_local_checkbox,
                 precision_mode,
-                add_metadata_checkbox
+                add_metadata_checkbox,
+                offline_mode_checkbox
             ],
             outputs=[single_output_text, output_image]
         )
@@ -566,7 +657,8 @@ def create_interface():
                 batch_folder,
                 output_folder_batch,
                 display_images_checkbox,
-                add_metadata_checkbox_batch
+                add_metadata_checkbox_batch,
+                offline_mode_checkbox_batch
             ],
             outputs=[batch_output_text, output_image_batch]
         )
@@ -581,6 +673,16 @@ def create_interface():
 
 if __name__ == "__main__":
     args = parse_args()
+    
+    # Handle offline mode from command line
+    if args.offline:
+        set_offline_mode(True)
+        print("\n" + "="*60)
+        print("OFFLINE MODE ENABLED via --offline flag")
+        print("No internet connections will be made.")
+        print("Make sure all required models are already cached!")
+        print("="*60 + "\n")
+    
     allowed_paths = args.allowed_paths.split(',') if args.allowed_paths else []  # Parse allowed paths
     demo = create_interface()
-    demo.launch(inbrowser=True, share=args.share, allowed_paths=allowed_paths) # Pass allowed paths to launch
+    demo.launch(inbrowser=True, share=args.share, allowed_paths=allowed_paths)  # Pass allowed paths to launch
