@@ -150,7 +150,9 @@ def load_model(weights_file: str, use_local: bool = False):
     """
     model_path = os.path.join("models", f"{weights_file}.pth")
     huggingface_path = f'ZhengPeng7/{weights_file}'
+    birefnet = None  # Initialize to track loading status
 
+    # Try local loading first if requested
     if use_local and LOCAL_MODEL_AVAILABLE and os.path.exists(model_path):
         try:
             birefnet = BiRefNet()
@@ -158,9 +160,14 @@ def load_model(weights_file: str, use_local: bool = False):
             print(f"Loaded model from local path: {model_path}")
         except Exception as e:
             print(f"Error loading from local path {model_path}: {e}.  Falling back to Hugging Face.")
-            use_local = False
+            birefnet = None  # Reset on failure
 
-    if not use_local or not os.path.exists(model_path):
+    # Only try HuggingFace if local loading failed or wasn't attempted
+    if birefnet is None:
+        # Warn user if they expected local loading
+        if use_local and not os.path.exists(model_path):
+            print(f"Warning: Local model file not found at {model_path}. Downloading from Hugging Face...")
+        
         try:
             if LOCAL_MODEL_AVAILABLE:
                 birefnet = BiRefNet.from_pretrained(huggingface_path)
@@ -394,7 +401,7 @@ def stop_batch_processing():
 
 def create_interface():
     with gr.Blocks() as demo:
-        gr.Markdown("## SECourses Improved BiRefNet HQ V7 - https://www.patreon.com/posts/121679760")
+        gr.Markdown("## SECourses Improved BiRefNet HQ V8 - https://www.patreon.com/posts/121679760")
         gr.Markdown("**New Features:** BFloat16 precision (default), Original resolution mode, Enhanced output organization")
 
         with gr.Tab("Single Image Processing"):
