@@ -14,6 +14,7 @@ evaluation/eval-*
 nohup.*
 tmp*
 *.pth
+presets
 core-*-python-*
 .DS_Store
 __MACOSX/
